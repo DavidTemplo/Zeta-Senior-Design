@@ -3,6 +3,7 @@ import time
 import math
 import csv
 import argparse
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime, timezone
@@ -264,15 +265,116 @@ def meshtastic_close():
     _MESH["iface"] = None
 
 # ============================================================
-# SDR HOOKS (stubs so you don't crash on trigger)
+# SDR HOOKS
 # ============================================================
 
+_SDR = {
+    "enabled": False,
+    "freq": 915e6,
+    "rate": 1e6,
+    "gain": 40.0,
+    "chunk_samps": 4096,
+    "out_template": "",
+    "thread": None,
+    "stop_event": None,
+    "active_run_id": None,
+}
+
+
+def _resolve_iq_path(run_id: str, rf_csv: str):
+    template = _SDR.get("out_template") or ""
+    if template:
+        if "{run_id}" in template:
+            return template.format(run_id=run_id)
+        return template
+    if rf_csv.lower().endswith(".csv"):
+        return rf_csv[:-4] + ".c64"
+    return rf_csv + ".c64"
+
+
+def _sdr_worker(run_id: str, iq_path: str, stop_event: threading.Event):
+    try:
+        import numpy as np
+        import SoapySDR
+        from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CF32
+    except Exception as e:
+        print(f"[SDR] disabled (import failed): {type(e).__name__}: {e}", flush=True)
+        return
+
+    try:
+        print("[SDR] Enumerating devices...", flush=True)
+        devs = SoapySDR.Device.enumerate()
+        if not devs:
+            raise RuntimeError("No SoapySDR devices found")
+
+        sdr = SoapySDR.Device(devs[0])
+        chan = 0
+        sdr.setSampleRate(SOAPY_SDR_RX, chan, _SDR["rate"])
+        sdr.setGain(SOAPY_SDR_RX, chan, _SDR["gain"])
+        sdr.setFrequency(SOAPY_SDR_RX, chan, _SDR["freq"])
+        try:
+            sdr.setBandwidth(SOAPY_SDR_RX, chan, _SDR["rate"])
+        except Exception:
+            pass
+
+        stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, [chan])
+        sdr.activateStream(stream)
+        time.sleep(0.1)
+
+        buf = np.empty(_SDR["chunk_samps"], dtype=np.complex64)
+        total_samps_logged = 0
+
+        print(f"[SDR] logging run_id={run_id} -> {iq_path}", flush=True)
+        with open(iq_path, "wb") as f:
+            while not stop_event.is_set():
+                sr = sdr.readStream(stream, [buf], _SDR["chunk_samps"], timeoutUs=int(1e6))
+                if sr.ret <= 0:
+                    continue
+
+                samples = buf[:sr.ret]
+                samples.tofile(f)
+                total_samps_logged += sr.ret
+
+        print(f"[SDR] stop run_id={run_id} samples={total_samps_logged}", flush=True)
+
+        sdr.deactivateStream(stream)
+        sdr.closeStream(stream)
+
+    except Exception as e:
+        print(f"[SDR] worker failed: {type(e).__name__}: {e}", flush=True)
+
 def sdr_start(run_id: str, rf_csv: str):
-    # TODO: replace with IQ capture hook / subprocess spawn
-    print(f"[SDR] START run_id={run_id} rf_csv={rf_csv}", flush=True)
+    if not _SDR["enabled"]:
+        print(f"[SDR] disabled; skip start run_id={run_id}", flush=True)
+        return
+    if _SDR["thread"] is not None:
+        print(f"[SDR] already running for run_id={_SDR['active_run_id']}", flush=True)
+        return
+
+    iq_path = _resolve_iq_path(run_id, rf_csv)
+    stop_event = threading.Event()
+    th = threading.Thread(target=_sdr_worker, args=(run_id, iq_path, stop_event), daemon=True)
+    _SDR["thread"] = th
+    _SDR["stop_event"] = stop_event
+    _SDR["active_run_id"] = run_id
+    th.start()
+    print(f"[SDR] START run_id={run_id} iq_file={iq_path}", flush=True)
 
 def sdr_stop(run_id: str):
+    th = _SDR.get("thread")
+    if th is None:
+        print(f"[SDR] STOP run_id={run_id} (not running)", flush=True)
+        return
+
     print(f"[SDR] STOP run_id={run_id}", flush=True)
+    _SDR["stop_event"].set()
+    th.join(timeout=3.0)
+    if th.is_alive():
+        print("[SDR] warning: worker did not exit before timeout", flush=True)
+
+    _SDR["thread"] = None
+    _SDR["stop_event"] = None
+    _SDR["active_run_id"] = None
 
 # ============================================================
 # NAV SAMPLE READER
@@ -331,6 +433,13 @@ def main():
 
     ap.add_argument("--nav-csv", type=str, default=None, help="NAV CSV path (default nav_<runid>.csv)")
     ap.add_argument("--rf-csv", type=str, default=None, help="RF CSV path (default rf_<runid>.csv)")
+    ap.add_argument("--sdr-enable", action="store_true", help="Enable SDR IQ logging between trigger start/stop")
+    ap.add_argument("--sdr-freq", type=float, default=915e6, help="SDR center frequency in Hz")
+    ap.add_argument("--sdr-rate", type=float, default=1e6, help="SDR sample rate in samples/sec")
+    ap.add_argument("--sdr-gain", type=float, default=40.0, help="SDR RX gain in dB")
+    ap.add_argument("--sdr-chunk-samps", type=int, default=4096, help="SDR samples per read chunk")
+    ap.add_argument("--sdr-out", type=str, default=None,
+                    help="IQ output path (supports {run_id}); default derives from --rf-csv as .c64")
 
     ap.add_argument("--require-3d-fix", action="store_true", default=True,
                     help="If set (default), only allow trigger when GPS mode >= 3.")
@@ -363,6 +472,13 @@ def main():
 
     detector = RateAwareRotationDetector(rot_cfg)
     period = 1.0 / max(args.hz, 0.1)
+
+    _SDR["enabled"] = args.sdr_enable
+    _SDR["freq"] = args.sdr_freq
+    _SDR["rate"] = args.sdr_rate
+    _SDR["gain"] = args.sdr_gain
+    _SDR["chunk_samps"] = args.sdr_chunk_samps
+    _SDR["out_template"] = args.sdr_out or ""
 
     # connect gpsd
     gpsd.connect()

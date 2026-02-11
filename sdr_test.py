@@ -73,4 +73,4 @@ def run_rx_test():
             sdr = None # Device release
 
 if __name__ == "__main__":
-    run_rx_test()   
+    run_rx_test()

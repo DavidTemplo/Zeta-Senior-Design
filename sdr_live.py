@@ -7,6 +7,7 @@ Example:
 """
 
 import argparse
+import math
 import time
 
 import numpy as np
@@ -27,7 +28,91 @@ def parse_args():
                    help="FFT size / samples per frame (default: 4096)")
     p.add_argument("--waterfall", action="store_true",
                    help="Show scrolling waterfall under the spectrum")
+    p.add_argument("--meshtastic-port", type=str, default="",
+                   help="Optional Meshtastic serial port for one-shot GPS capture")
+    p.add_argument("--gps-timeout", type=float, default=8.0,
+                   help="GPS timeout in seconds for one-shot Meshtastic read")
+    p.add_argument("--i2c-bus", type=int, default=1,
+                   help="I2C bus used by QMC5883L magnetometer (default: 1)")
+    p.add_argument("--mag-addr", type=lambda x: int(x, 0), default=0x0D,
+                   help="QMC5883L I2C address (default: 0x0D)")
+    p.add_argument("--declination", type=float, default=0.0,
+                   help="Magnetic declination in degrees (default: 0.0)")
     return p.parse_args()
+
+
+def get_gps_once(meshtastic_port: str, timeout_s: float = 8.0):
+    """Best-effort one-shot GPS read from Meshtastic."""
+    if not meshtastic_port:
+        return (None, None, "SKIPPED")
+
+    try:
+        from meshtastic.serial_interface import SerialInterface
+        from pubsub import pub
+    except Exception:
+        return (None, None, "NO_MESHTASTIC")
+
+    lat = lon = None
+    status = "NO_FIX"
+    got = {"ok": False}
+
+    def on_receive(packet, interface):
+        nonlocal lat, lon, status
+        decoded = packet.get("decoded", {})
+        pos = decoded.get("position")
+        if not isinstance(pos, dict):
+            return
+        lat = pos.get("latitude", lat)
+        lon = pos.get("longitude", lon)
+        if lat is not None and lon is not None:
+            status = "FIX"
+            got["ok"] = True
+
+    iface = None
+    try:
+        iface = SerialInterface(meshtastic_port)
+        pub.subscribe(on_receive, "meshtastic.receive")
+        t0 = time.time()
+        while time.time() - t0 < timeout_s and not got["ok"]:
+            time.sleep(0.1)
+    except Exception as exc:
+        return (None, None, f"ERR:{type(exc).__name__}")
+    finally:
+        try:
+            if iface is not None:
+                iface.close()
+        except Exception:
+            pass
+
+    return (lat, lon, status)
+
+
+def get_heading_once(i2c_bus: int, addr: int, declination_deg: float = 0.0):
+    """Best-effort one-shot heading from QMC5883L magnetometer."""
+    try:
+        from smbus2 import SMBus
+    except Exception:
+        return (None, "NO_SMBUS2")
+
+    def s16(lo, hi):
+        val = (hi << 8) | lo
+        return val - 65536 if val & 0x8000 else val
+
+    try:
+        with SMBus(i2c_bus) as bus:
+            bus.write_byte_data(addr, 0x0A, 0x80)  # reset
+            time.sleep(0.01)
+            bus.write_byte_data(addr, 0x09, 0x1D)  # continuous, 50 Hz
+            time.sleep(0.01)
+            data = bus.read_i2c_block_data(addr, 0x00, 6)
+    except Exception as exc:
+        return (None, f"ERR:{type(exc).__name__}")
+
+    x = s16(data[0], data[1])
+    y = s16(data[2], data[3])
+    heading = math.degrees(math.atan2(y, x))
+    heading = (heading + 360.0 + declination_deg) % 360.0
+    return (heading, "OK")
 
 
 def main():
@@ -38,6 +123,12 @@ def main():
     print(f"Sample rate: {args.rate/1e6:.3f} Msps")
     print(f"Gain:        {args.gain:.1f} dB")
     print(f"FFT size:    {args.fft}")
+
+    lat, lon, gps_status = get_gps_once(args.meshtastic_port, args.gps_timeout)
+    heading, heading_status = get_heading_once(args.i2c_bus, args.mag_addr, args.declination)
+    heading_txt = "N/A" if heading is None else f"{heading:.2f}°"
+    print(f"GPS snapshot: lat={lat} lon={lon} status={gps_status}")
+    print(f"Heading:      {heading_txt} status={heading_status}")
 
     # ---------------------------------------------------------------
     # 1. Open device via enumerate() so we don't depend on exact args

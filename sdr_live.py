@@ -7,6 +7,7 @@ Example:
 """
 
 import argparse
+import math
 import time
 
 import numpy as np
@@ -27,7 +28,112 @@ def parse_args():
                    help="FFT size / samples per frame (default: 4096)")
     p.add_argument("--waterfall", action="store_true",
                    help="Show scrolling waterfall under the spectrum")
+    p.add_argument("--gps-port", type=str, default="",
+                   help="Optional GPS serial port for one-shot lat/lon read")
+    p.add_argument("--gps-baud", type=int, default=9600,
+                   help="GPS serial baud rate (default: 9600)")
+    p.add_argument("--gps-timeout", type=float, default=8.0,
+                   help="Timeout in seconds for one-shot serial GPS read")
+    p.add_argument("--i2c-bus", type=int, default=1,
+                   help="I2C bus used by QMC5883L magnetometer (default: 1)")
+    p.add_argument("--mag-addr", type=lambda x: int(x, 0), default=0x0D,
+                   help="QMC5883L I2C address (default: 0x0D)")
+    p.add_argument("--declination", type=float, default=0.0,
+                   help="Magnetic declination in degrees (default: 0.0)")
     return p.parse_args()
+
+
+def _nmea_to_decimal(raw: str, hemi: str):
+    if not raw or not hemi:
+        return None
+    if hemi in ("N", "S"):
+        deg_len = 2
+    elif hemi in ("E", "W"):
+        deg_len = 3
+    else:
+        return None
+
+    try:
+        degrees = float(raw[:deg_len])
+        minutes = float(raw[deg_len:])
+    except ValueError:
+        return None
+
+    value = degrees + (minutes / 60.0)
+    if hemi in ("S", "W"):
+        value = -value
+    return value
+
+
+def get_gps_once(serial_port: str, baud: int = 9600, timeout_s: float = 8.0):
+    """Best-effort one-shot GPS read from a serial NMEA stream."""
+    if not serial_port:
+        return (None, None, "SKIPPED")
+
+    try:
+        import serial
+    except Exception:
+        return (None, None, "NO_PYSERIAL")
+
+    deadline = time.time() + timeout_s
+
+    try:
+        with serial.Serial(serial_port, baudrate=baud, timeout=0.5) as ser:
+            while time.time() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = raw.decode("ascii", errors="ignore").strip()
+                if line.startswith("$GPGGA") or line.startswith("$GNGGA"):
+                    parts = line.split(",")
+                    if len(parts) < 7:
+                        continue
+                    fix_q = parts[6]
+                    lat = _nmea_to_decimal(parts[2], parts[3])
+                    lon = _nmea_to_decimal(parts[4], parts[5])
+                    if fix_q and fix_q != "0" and lat is not None and lon is not None:
+                        return (lat, lon, "FIX")
+                elif line.startswith("$GPRMC") or line.startswith("$GNRMC"):
+                    parts = line.split(",")
+                    if len(parts) < 7:
+                        continue
+                    status = parts[2]
+                    lat = _nmea_to_decimal(parts[3], parts[4])
+                    lon = _nmea_to_decimal(parts[5], parts[6])
+                    if status == "A" and lat is not None and lon is not None:
+                        return (lat, lon, "FIX")
+    except Exception as exc:
+        return (None, None, f"ERR:{type(exc).__name__}")
+
+    return (None, None, "NO_FIX")
+
+
+def get_heading_once(i2c_bus: int, addr: int, declination_deg: float = 0.0):
+    """Best-effort one-shot heading from QMC5883L magnetometer."""
+    try:
+        from smbus2 import SMBus
+    except Exception:
+        return (None, "NO_SMBUS2")
+
+    def s16(lo, hi):
+        val = (hi << 8) | lo
+        return val - 65536 if val & 0x8000 else val
+
+    try:
+        with SMBus(i2c_bus) as bus:
+            bus.write_byte_data(addr, 0x0A, 0x80)  # reset
+            time.sleep(0.01)
+            bus.write_byte_data(addr, 0x09, 0x1D)  # continuous, 50 Hz
+            time.sleep(0.01)
+            data = bus.read_i2c_block_data(addr, 0x00, 6)
+    except Exception as exc:
+        return (None, f"ERR:{type(exc).__name__}")
+
+    x = s16(data[0], data[1])
+    y = s16(data[2], data[3])
+    heading = math.degrees(math.atan2(y, x))
+    heading = (heading + 360.0 + declination_deg) % 360.0
+    return (heading, "OK")
 
 
 def main():
@@ -38,6 +144,12 @@ def main():
     print(f"Sample rate: {args.rate/1e6:.3f} Msps")
     print(f"Gain:        {args.gain:.1f} dB")
     print(f"FFT size:    {args.fft}")
+
+    lat, lon, gps_status = get_gps_once(args.gps_port, args.gps_baud, args.gps_timeout)
+    heading, heading_status = get_heading_once(args.i2c_bus, args.mag_addr, args.declination)
+    heading_txt = "N/A" if heading is None else f"{heading:.2f}°"
+    print(f"GPS snapshot: lat={lat} lon={lon} status={gps_status}")
+    print(f"Heading:      {heading_txt} status={heading_status}")
 
     # ---------------------------------------------------------------
     # 1. Open device via enumerate() so we don't depend on exact args

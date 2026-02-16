@@ -14,14 +14,22 @@ import math
 import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import SoapySDR
 from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Manual GPS + heading + IQ capture")
+    p.add_argument("--config", type=str, default="",
+                   help="Path to TOML config file")
 
     # SDR / IQ logging
     p.add_argument("--freq", type=float, default=915e6)
@@ -53,6 +61,87 @@ def parse_args():
     p.add_argument("--heading-csv", type=str, default="banshee_manual_heading.csv")
 
     return p.parse_args()
+
+
+def _load_toml_config(path: str):
+    if not path:
+        return {}
+    if tomllib is None:
+        raise RuntimeError("TOML config requires Python 3.11+ (tomllib)")
+
+    cfg_path = Path(path)
+    with cfg_path.open("rb") as f:
+        data = tomllib.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Top-level TOML value must be a table/object")
+    return data
+
+
+def _parse_hex_or_int(value, default: int):
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value, 0)
+    return default
+
+
+def apply_toml_config(args):
+    cfg = _load_toml_config(args.config)
+    if not cfg:
+        return args
+
+    general = cfg.get("general", {})
+    compass = cfg.get("compass", {})
+    sdr = cfg.get("sdr", {})
+
+    # NOTE: We currently read gps/meshtastic tables for compatibility only.
+    # Keys not used by this script are intentionally ignored.
+    _ = cfg.get("gps", {})
+    _ = cfg.get("meshtastic", {})
+
+    # [general]
+    output_dir = general.get("output_dir")
+    if output_dir:
+        iq_name = args.iq_out if os.path.dirname(args.iq_out) else os.path.basename(args.iq_out)
+        session_name = args.session_csv if os.path.dirname(args.session_csv) else os.path.basename(args.session_csv)
+        heading_name = args.heading_csv if os.path.dirname(args.heading_csv) else os.path.basename(args.heading_csv)
+
+        args.iq_out = str(Path(output_dir) / iq_name)
+        args.session_csv = str(Path(output_dir) / session_name)
+        args.heading_csv = str(Path(output_dir) / heading_name)
+
+    hz = general.get("hz")
+    if hz:
+        args.heading_interval = 1.0 / float(hz)
+
+    # [compass]
+    if "i2c_bus" in compass:
+        args.i2c_bus = int(compass["i2c_bus"])
+    args.mag_addr = _parse_hex_or_int(compass.get("addr"), args.mag_addr)
+    if "declination" in compass:
+        args.declination = float(compass["declination"])
+    if "alpha" in compass:
+        args.alpha = float(compass["alpha"])
+    if "x_off" in compass:
+        args.x_off = float(compass["x_off"])
+    if "y_off" in compass:
+        args.y_off = float(compass["y_off"])
+
+    # [sdr]
+    if "freq_hz" in sdr:
+        args.freq = float(sdr["freq_hz"])
+    if "rate_sps" in sdr:
+        args.rate = float(sdr["rate_sps"])
+    if "gain_db" in sdr:
+        args.gain = float(sdr["gain_db"])
+    if "chunk_samps" in sdr:
+        args.chunk_samps = int(sdr["chunk_samps"])
+    if "out" in sdr and sdr["out"]:
+        args.iq_out = str(sdr["out"])
+
+    return args
 
 
 def append_csv(path: str, row: dict):
@@ -167,6 +256,11 @@ def read_heading_once(bus, addr: int, x_off: float, y_off: float, declination_de
 
 def main():
     args = parse_args()
+    args = apply_toml_config(args)
+
+    out_dir = os.path.dirname(args.iq_out) or os.path.dirname(args.session_csv) or os.path.dirname(args.heading_csv)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     print("=== Banshee Manual Capture ===")
     print(f"Center freq: {args.freq/1e6:.3f} MHz")

@@ -3,7 +3,7 @@
 banshee_manual.py
 
 Manual capture utility that performs, in one run:
-1) One-shot GPS snapshot from a serial NMEA GPS.
+1) One-shot GPS snapshot from gpsd JSON (or optional serial NMEA GPS).
 2) LimeSDR raw I/Q logging.
 3) Magnetometer heading logging (MMC5883-style I2C reads).
 """
@@ -19,6 +19,13 @@ from pathlib import Path
 import numpy as np
 import SoapySDR
 from SoapySDR import SOAPY_SDR_CF32, SOAPY_SDR_RX
+
+# GPSD mode requires: pip install gpsd-py3
+# and gpsd daemon listening on localhost:2947 (e.g., via gpsd.socket).
+try:
+    import gpsd
+except Exception:
+    gpsd = None
 
 try:
     import tomllib
@@ -39,7 +46,12 @@ def parse_args():
     p.add_argument("--chunk-samps", type=int, default=4096)
     p.add_argument("--iq-out", type=str, default="iq_dump.c64")
 
-    # GPS snapshot (serial NMEA)
+    # GPS snapshot source (default gpsd JSON)
+    p.add_argument("--gps-source", choices=["gpsd", "serial"], default="gpsd",
+                   help="GPS source: gpsd JSON (default) or serial NMEA")
+    p.add_argument("--gpsd-host", type=str, default="127.0.0.1")
+    p.add_argument("--gpsd-port", type=int, default=2947)
+    # Used only when --gps-source serial
     p.add_argument("--gps-port", type=str, default="",
                    help="GPS serial port (e.g. /dev/ttyUSB0)")
     p.add_argument("--gps-baud", type=int, default=9600)
@@ -175,7 +187,37 @@ def _nmea_to_decimal(raw: str, hemi: str):
     return value
 
 
-def get_gps_once(serial_port: str, baud: int, timeout_s: float):
+def _valid_lat_lon(lat, lon):
+    return (
+        isinstance(lat, (int, float))
+        and isinstance(lon, (int, float))
+        and not math.isnan(lat)
+        and not math.isnan(lon)
+    )
+
+
+def get_gps_once_gpsd(host: str, port: int, timeout_s: float):
+    try:
+        if gpsd is None:
+            raise ModuleNotFoundError("gpsd")
+        gpsd.connect(host=host, port=port)
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            pkt = gpsd.get_current()
+            mode = getattr(pkt, "mode", 0) or 0
+            if mode >= 2:
+                lat = getattr(pkt, "lat", None)
+                lon = getattr(pkt, "lon", None)
+                if _valid_lat_lon(lat, lon):
+                    return (float(lat), float(lon), "FIX")
+            time.sleep(0.2)
+    except Exception as exc:
+        return (None, None, f"ERR:{type(exc).__name__}")
+
+    return (None, None, "NO_FIX")
+
+
+def get_gps_once_serial(serial_port: str, baud: int, timeout_s: float):
     if not serial_port:
         return (None, None, "SKIPPED")
 
@@ -216,6 +258,12 @@ def get_gps_once(serial_port: str, baud: int, timeout_s: float):
         return (None, None, f"ERR:{type(exc).__name__}")
 
     return (None, None, "NO_FIX")
+
+
+def get_gps_once(args):
+    if args.gps_source == "serial":
+        return get_gps_once_serial(args.gps_port, args.gps_baud, args.gps_timeout)
+    return get_gps_once_gpsd(args.gpsd_host, args.gpsd_port, args.gps_timeout)
 
 
 def s16(lo, hi):
@@ -269,8 +317,8 @@ def main():
     print(f"Duration:    {args.seconds:.2f} s")
 
     # 1) One-shot GPS snapshot
-    lat, lon, gps_status = get_gps_once(args.gps_port, args.gps_baud, args.gps_timeout)
-    print(f"[GPS] lat={lat} lon={lon} status={gps_status}")
+    lat, lon, gps_status = get_gps_once(args)
+    print(f"[GPS] lat={lat} lon={lon} status={gps_status} source={args.gps_source}")
 
     ts_start = datetime.now(timezone.utc).isoformat()
     append_csv(args.session_csv, {
@@ -334,6 +382,11 @@ def main():
 
                 now = time.time()
                 if bus is not None and now >= next_heading_t:
+                    row_lat, row_lon, row_gps_status = lat, lon, gps_status
+                    if args.gps_source == "gpsd":
+                        row_lat, row_lon, row_gps_status = get_gps_once_gpsd(
+                            args.gpsd_host, args.gpsd_port, timeout_s=0.5
+                        )
                     try:
                         x, y, z, xc, yc, hdg = read_heading_once(
                             bus, args.mag_addr, args.x_off, args.y_off, args.declination
@@ -341,9 +394,9 @@ def main():
                         smoothed = ema_angle(smoothed, hdg, args.alpha)
                         append_csv(args.heading_csv, {
                             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                            "gps_lat": lat,
-                            "gps_lon": lon,
-                            "gps_status": gps_status,
+                            "gps_lat": row_lat,
+                            "gps_lon": row_lon,
+                            "gps_status": row_gps_status,
                             "heading_deg": hdg,
                             "heading_smooth_deg": smoothed,
                             "mx_raw": x,
@@ -356,9 +409,9 @@ def main():
                     except Exception as exc:
                         append_csv(args.heading_csv, {
                             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                            "gps_lat": lat,
-                            "gps_lon": lon,
-                            "gps_status": gps_status,
+                            "gps_lat": row_lat,
+                            "gps_lon": row_lon,
+                            "gps_status": row_gps_status,
                             "heading_deg": "",
                             "heading_smooth_deg": "",
                             "mx_raw": "",
